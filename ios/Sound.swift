@@ -41,7 +41,8 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
 
     public func startRecorder(uri: String?, audioSets: AudioSet?, meteringEnabled: Bool?) throws -> Promise<String> {
         let promise = Promise<String>()
-        
+        setupInterruptionObserver()
+
         // Sanitize audioSets to ignore Android-specific fields on iOS to prevent crashes
         let sanitizedAudioSets = audioSets.map { original in
             var sanitized = original
@@ -424,7 +425,7 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
                 DispatchQueue.main.async {
                     recorder.stop()
                     self.stopRecordTimer()
-
+                    self.removeInterruptionObserver()
                     // Continue cleanup in background
                     DispatchQueue.global(qos: .userInitiated).async {
                         self.audioRecorder = nil
@@ -445,7 +446,6 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
     }
 
     // MARK: - Playback Methods
-
     public func startPlayer(uri: String?, httpHeaders: Dictionary<String, String>?) throws -> Promise<String> {
         let promise = Promise<String>()
 
@@ -1026,8 +1026,65 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
         }
     }
 
+    // MARK: - Interruption Handling
+    
+    private func setupInterruptionObserver() {
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioSessionInterruption),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+    }
+    
+    private func removeInterruptionObserver() {
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: nil)
+    }
+    
+    @objc private func handleAudioSessionInterruption(notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+            return
+        }
+        
+        switch type {
+        case .began:
+            // Interruption began (e.g., phone call) - stop recording to avoid losing audio
+            if let recorder = audioRecorder, recorder.isRecording {
+                let fileURL = recorder.url
+                let currentTime = recorder.currentTime * 1000
+                
+                // Stop recording (not pause) to save the audio
+                recorder.stop()
+                stopRecordTimer()
+                
+                // Clean up current recorder but keep session for potential resume
+                audioRecorder = nil
+                try? recordingSession?.setActive(false)
+                recordingSession = nil
+                
+                // Notify listener with interruption status and file path
+                if let listener = recordBackListener {
+                    listener(RecordBackType(
+                        isRecording: false,
+                        currentPosition: currentTime,
+                        currentMetering: nil,
+                        recordSecs: currentTime,
+                    ))
+                }
+            }
+        case .ended:
+            break
+        @unknown default:
+            break
+        }
+    }
+    
     // MARK: - AVAudioPlayerDelegate via proxy
     deinit {
+        removeInterruptionObserver()
         recordTimer?.invalidate()
         playTimer?.invalidate()
     }

@@ -42,6 +42,10 @@ class HybridSound : HybridSoundSpec() {
     private var lastMeteringUpdateTime = 0L
     private var lastMeteringValue = SILENCE_THRESHOLD_DB
 
+    // Audio focus for call interruption handling
+    private var audioManager: AudioManager? = null
+    private var audioFocusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
+
     private val handler = Handler(Looper.getMainLooper())
 
     private val context: Context
@@ -241,6 +245,9 @@ class HybridSound : HybridSoundSpec() {
                 recordStartTime = System.currentTimeMillis()
                 pausedRecordTime = 0L
 
+                // Request audio focus for call interruption handling
+                setupAudioFocus()
+
                 // Start timer on main thread
                 handler.post {
                     startRecordTimer()
@@ -299,6 +306,9 @@ class HybridSound : HybridSoundSpec() {
                 lastMeteringUpdateTime = 0L
                 lastMeteringValue = SILENCE_THRESHOLD_DB
 
+                // Release audio focus
+                releaseAudioFocus()
+
                 handler.post {
                     stopRecordTimer()
                 }
@@ -318,6 +328,9 @@ class HybridSound : HybridSoundSpec() {
                 meteringEnabled = false
                 lastMeteringUpdateTime = 0L
                 lastMeteringValue = SILENCE_THRESHOLD_DB
+
+                // Release audio focus even on error
+                releaseAudioFocus()
 
                 promise.reject(e)
             }
@@ -720,5 +733,66 @@ class HybridSound : HybridSoundSpec() {
     private fun stopPlayTimer() {
         playTimer?.cancel()
         playTimer = null
+    }
+
+    // MARK: - Audio Focus Handling for Call Interruption
+
+    private fun setupAudioFocus() {
+        audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+            when (focusChange) {
+                AudioManager.AUDIOFOCUS_LOSS,
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                    // Audio focus lost (e.g., phone call started)
+                    // Pause recording if active
+                    handler.post {
+                        mediaRecorder?.let { recorder ->
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                                    if (recorder.isRecording) {
+                                        recorder.pause()
+                                        pausedRecordTime = System.currentTimeMillis() - recordStartTime
+                                        stopRecordTimer()
+                                        
+                                        // Notify listener that recording was paused
+                                        recordBackListener?.invoke(
+                                            RecordBackType(
+                                                isRecording = false,
+                                                currentPosition = pausedRecordTime.toDouble(),
+                                                currentMetering = if (meteringEnabled) lastMeteringValue else null,
+                                                recordSecs = pausedRecordTime.toDouble()
+                                            )
+                                        )
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                // Ignore errors during pause
+                            }
+                        }
+                    }
+                }
+                AudioManager.AUDIOFOCUS_GAIN -> {
+                    // Audio focus regained (e.g., phone call ended)
+                    // Note: We don't auto-resume, let the OS handle it naturally
+                }
+                else -> {
+                    // Other focus changes - no action needed
+                }
+            }
+        }
+        
+        audioManager?.requestAudioFocus(
+            audioFocusChangeListener,
+            AudioManager.STREAM_MUSIC,
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+        )
+    }
+
+    private fun releaseAudioFocus() {
+        audioFocusChangeListener?.let { listener ->
+            audioManager?.abandonAudioFocus(listener)
+        }
+        audioFocusChangeListener = null
+        audioManager = null
     }
 }
