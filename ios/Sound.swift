@@ -36,11 +36,29 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
     private var subscriptionDuration: TimeInterval = 0.06
     private var playbackRate: Double = 1.0 // default 1x
     private var recordingSession: AVAudioSession?
+    private var wasRecordingBeforeInterruption: Bool = false
+    
+    // Store list of recorded files (for call interruption handling)
+    private var recordedFiles: [String] = []
+    private var lastAudioSets: AudioSet?
+    private var lastMeteringEnabled: Bool = false
+    private var lastRecordingURI: String?
 
     // MARK: - Recording Methods
 
     public func startRecorder(uri: String?, audioSets: AudioSet?, meteringEnabled: Bool?) throws -> Promise<String> {
         let promise = Promise<String>()
+        
+        // Reset recorded files list only when starting a completely new recording session
+        // (not when auto-resuming after call - that's handled in interruption handler)
+        if !wasRecordingBeforeInterruption {
+            recordedFiles = []
+        }
+        
+        // Store settings for potential resume after call interruption
+        lastAudioSets = audioSets
+        lastMeteringEnabled = meteringEnabled ?? false
+        lastRecordingURI = uri
         
         // Sanitize audioSets to ignore Android-specific fields on iOS to prevent crashes
         let sanitizedAudioSets = audioSets.map { original in
@@ -240,7 +258,13 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
 
                             if started {
                                 self.startRecordTimer()
-                                promise.resolve(withResult: fileURL.absoluteString)
+                                self.setupInterruptionObserver()
+                                // Only resolve promise if it's a new recording (not auto-resume after call)
+                                // For auto-resume, we use a dummy promise that we don't resolve
+                                // Check if this is auto-resume by checking if recordedFiles is not empty
+                                if self.recordedFiles.isEmpty {
+                                    promise.resolve(withResult: fileURL.absoluteString)
+                                }
                             } else if recordAttempts < maxAttempts {
                                 print("🎙️ Recording attempt \(recordAttempts) failed, retrying in 0.3s...")
 
@@ -424,6 +448,12 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
                 DispatchQueue.main.async {
                     recorder.stop()
                     self.stopRecordTimer()
+                    self.removeInterruptionObserver()
+
+                    // Add current file to recorded files list if not already added
+                    if !self.recordedFiles.contains(url) {
+                        self.recordedFiles.append(url)
+                    }
 
                     // Continue cleanup in background
                     DispatchQueue.global(qos: .userInitiated).async {
@@ -433,11 +463,56 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
                         try? self.recordingSession?.setActive(false)
                         self.recordingSession = nil
 
-                        promise.resolve(withResult: url)
+                        // Return list of recorded files as JSON array string
+                        let result: String
+                        if self.recordedFiles.count > 1 {
+                            // Multiple files (had call interruption)
+                            if let jsonData = try? JSONSerialization.data(withJSONObject: self.recordedFiles),
+                               let jsonString = String(data: jsonData, encoding: .utf8) {
+                                result = jsonString
+                            } else {
+                                // Fallback to comma-separated
+                                result = self.recordedFiles.joined(separator: ",")
+                            }
+                        } else {
+                            // Single file (no interruption)
+                            result = url
+                        }
+                        
+                        // Reset recorded files list
+                        self.recordedFiles = []
+                        self.lastAudioSets = nil
+                        self.lastMeteringEnabled = false
+                        self.lastRecordingURI = nil
+
+                        promise.resolve(withResult: result)
                     }
                 }
             } else {
-                promise.reject(withError: RuntimeError.error(withMessage: "No recorder instance"))
+                // No active recorder, but might have recorded files from previous interruptions
+                if !self.recordedFiles.isEmpty {
+                    let result: String
+                    if self.recordedFiles.count > 1 {
+                        if let jsonData = try? JSONSerialization.data(withJSONObject: self.recordedFiles),
+                           let jsonString = String(data: jsonData, encoding: .utf8) {
+                            result = jsonString
+                        } else {
+                            result = self.recordedFiles.joined(separator: ",")
+                        }
+                    } else {
+                        result = self.recordedFiles.first ?? ""
+                    }
+                    
+                    // Reset recorded files list
+                    self.recordedFiles = []
+                    self.lastAudioSets = nil
+                    self.lastMeteringEnabled = false
+                    self.lastRecordingURI = nil
+                    
+                    promise.resolve(withResult: result)
+                } else {
+                    promise.reject(withError: RuntimeError.error(withMessage: "No recorder instance"))
+                }
             }
         }
 
@@ -1026,8 +1101,116 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
         }
     }
 
+    // MARK: - Interruption Handling
+    
+    private func setupInterruptionObserver() {
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioSessionInterruption),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+    }
+    
+    private func removeInterruptionObserver() {
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: nil)
+    }
+    
+    @objc private func handleAudioSessionInterruption(notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+            return
+        }
+        
+        switch type {
+        case .began:
+            // Interruption began (e.g., phone call) - stop recording to avoid losing audio
+            if let recorder = audioRecorder, recorder.isRecording {
+                wasRecordingBeforeInterruption = true
+                let fileURL = recorder.url
+                let currentTime = recorder.currentTime * 1000
+                
+                // Stop recording (not pause) to save the audio
+                recorder.stop()
+                stopRecordTimer()
+                
+                // Save current file to recorded files list
+                recordedFiles.append(fileURL.absoluteString)
+                
+                // Clean up current recorder but keep session for potential resume
+                audioRecorder = nil
+                try? recordingSession?.setActive(false)
+                recordingSession = nil
+                
+                // Notify listener with interruption status and file path
+                if let listener = recordBackListener {
+                    listener(RecordBackType(
+                        isRecording: false,
+                        currentPosition: currentTime,
+                        currentMetering: nil,
+                        recordSecs: currentTime,
+                    ))
+                }
+            }
+        case .ended:
+            // Interruption ended - create new recording
+            if wasRecordingBeforeInterruption {
+                wasRecordingBeforeInterruption = false
+                
+                // Resume recording with new file
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+                    
+                    // Recreate recording with saved settings
+                    do {
+                        // Setup audio session again
+                        self.recordingSession = AVAudioSession.sharedInstance()
+                        
+                        let sessionMode = self.lastAudioSets?.AVModeIOS.map(self.getAudioSessionMode) ?? .default
+                        
+                        try self.recordingSession?.setCategory(.playAndRecord,
+                                                             mode: sessionMode,
+                                                             options: [.defaultToSpeaker, .allowBluetooth])
+                        try self.recordingSession?.setActive(true)
+                        
+                        // Request permission if needed
+                        self.recordingSession?.requestRecordPermission { [weak self] allowed in
+                            guard let self = self, allowed else { return }
+                            
+                            // Continue in background - create dummy promise for auto-resume
+                            // Mark that we're resuming so setupAndStartRecording knows not to resolve promise
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let dummyPromise = Promise<String>()
+                                // Keep wasRecordingBeforeInterruption flag temporarily to indicate auto-resume
+                                let wasResuming = self.wasRecordingBeforeInterruption
+                                self.wasRecordingBeforeInterruption = true // Temporarily set to prevent promise resolution
+                                self.setupAndStartRecording(
+                                    uri: self.lastRecordingURI,
+                                    audioSets: self.lastAudioSets,
+                                    meteringEnabled: self.lastMeteringEnabled,
+                                    promise: dummyPromise
+                                )
+                                // Reset flag after a delay to allow recording to start
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                    self.wasRecordingBeforeInterruption = false
+                                }
+                            }
+                        }
+                    } catch {
+                        print("🎙️ Failed to resume recording after call: \(error)")
+                    }
+                }
+            }
+        @unknown default:
+            break
+        }
+    }
+    
     // MARK: - AVAudioPlayerDelegate via proxy
     deinit {
+        removeInterruptionObserver()
         recordTimer?.invalidate()
         playTimer?.invalidate()
     }
