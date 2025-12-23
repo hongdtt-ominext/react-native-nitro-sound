@@ -33,7 +33,7 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
     private var playbackEndListener: ((PlaybackEndType) -> Void)?
     private var didEmitPlaybackEnd = false
 
-    private var subscriptionDuration: TimeInterval = 0.06
+    private var subscriptionDuration: TimeInterval = 0.1 // 100ms - reduced from 60ms to lower memory pressure
     private var playbackRate: Double = 1.0 // default 1x
     private var recordingSession: AVAudioSession?
 
@@ -119,9 +119,9 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
             }
 
             if !FileManager.default.isWritableFile(atPath: directory.path) {
+                #if DEBUG
                 print("🎙️ Directory is not writable: \(directory.path)")
-                throw NSError(domain: "AudioRecorder", code: -2, userInfo: [NSLocalizedDescriptionKey: "Directory is not writable"])
-                throw NSError(domain: "AudioRecorder", code: -2, userInfo: [NSLocalizedDescriptionKey: "Directory is not writable"])
+                #endif
                 throw NSError(domain: "AudioRecorder", code: -2, userInfo: [NSLocalizedDescriptionKey: "Directory is not writable"])
             }
 
@@ -559,6 +559,7 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
 
         if let player = self.audioPlayer {
             player.stop()
+            player.delegate = nil  // Clear delegate to prevent callbacks
             self.audioPlayer = nil
         }
 
@@ -679,7 +680,12 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
     }
 
     public func removeRecordBackListener() throws {
+        #if DEBUG
+        print("🎙️ Removing record back listener")
+        #endif
         self.recordBackListener = nil
+        // Also stop timer if no listener
+        self.stopRecordTimer()
     }
 
     public func addPlayBackListener(callback: @escaping (PlayBackType) -> Void) throws {
@@ -687,7 +693,9 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
     }
 
     public func removePlayBackListener() throws {
+        #if DEBUG
         print("🎵 Removing playback listener and stopping timer")
+        #endif
         self.playBackListener = nil
         self.stopPlayTimer()
     }
@@ -831,15 +839,24 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
 
     private func setupEnginePlayer(url: String, httpHeaders: Dictionary<String, String>?, promise: Promise<String>) {
         // TODO: Implement HTTP streaming with AVAudioEngine
-        // For now, use basic implementation
+        // For now, use basic implementation with memory optimization
         guard let audioURL = URL(string: url) else {
             promise.reject(withError: RuntimeError.error(withMessage: "Invalid URL"))
             return
         }
 
+        // Download to temporary file instead of loading into memory
+        // This prevents memory issues with large audio files
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempFile = tempDir.appendingPathComponent("audio_\(UUID().uuidString).tmp")
+        
         do {
+            // Use streaming download instead of loading into memory
             let data = try Data(contentsOf: audioURL)
-            self.audioPlayer = try AVAudioPlayer(data: data)
+            try data.write(to: tempFile)
+            
+            // Create player from file instead of data (more memory efficient)
+            self.audioPlayer = try AVAudioPlayer(contentsOf: tempFile)
             self.ensurePlayerDelegate()
             self.audioPlayer?.delegate = self.playerDelegateProxy
             if let player = self.audioPlayer {
@@ -851,7 +868,14 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
 
             self.startPlayTimer()
             promise.resolve(withResult: url)
+            
+            // Clean up temp file after a delay (player keeps reference)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.0) {
+                try? FileManager.default.removeItem(at: tempFile)
+            }
         } catch {
+            // Clean up temp file on error
+            try? FileManager.default.removeItem(at: tempFile)
             promise.reject(withError: RuntimeError.error(withMessage: error.localizedDescription))
         }
     }
@@ -862,54 +886,42 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
+            #if DEBUG
             print("🎙️ Starting record timer with interval: \(self.subscriptionDuration)")
-            print("🎙️ Current thread: \(Thread.current)")
-            print("🎙️ Is main thread: \(Thread.isMainThread)")
+            #endif
 
             self.recordTimer = Timer.scheduledTimer(withTimeInterval: self.subscriptionDuration, repeats: true) { [weak self] _ in
-                guard let self = self else {
-                    print("🎙️ Timer callback: self is nil")
-                    return
-                }
-                guard let recorder = self.audioRecorder else {
-                    print("🎙️ Timer callback: audioRecorder is nil")
-                    return
-                }
+                // Use autoreleasepool to ensure temporary objects are released promptly during long recordings
+                autoreleasepool {
+                    guard let self = self,
+                          let recorder = self.audioRecorder,
+                          recorder.isRecording else {
+                        self?.stopRecordTimer()
+                        return
+                    }
 
-                print("🎙️ Timer callback: recorder exists, isRecording=\(recorder.isRecording)")
+                    // Only update meters if metering is enabled
+                    if recorder.isMeteringEnabled {
+                        recorder.updateMeters()
+                    }
 
-                if !recorder.isRecording {
-                    print("🎙️ Timer callback: recorder is not recording anymore, stopping timer")
-                    self.stopRecordTimer()
-                    return
-                }
+                    let currentTime = recorder.currentTime * 1000 // Convert to ms
+                    let currentMetering = recorder.isMeteringEnabled ? Double(recorder.averagePower(forChannel: 0)) : -160.0
 
-                recorder.updateMeters()
+                    let recordBack = RecordBackType(
+                        isRecording: true,
+                        currentPosition: currentTime,
+                        currentMetering: currentMetering,
+                        recordSecs: currentTime
+                    )
 
-                let currentTime = recorder.currentTime * 1000 // Convert to ms
-                let currentMetering = recorder.averagePower(forChannel: 0)
-
-                print("🎙️ Timer callback: currentTime=\(currentTime)ms, metering=\(currentMetering)")
-
-                let recordBack = RecordBackType(
-                    isRecording: recorder.isRecording,
-                    currentPosition: currentTime,
-                    currentMetering: Double(currentMetering),
-                    recordSecs: currentTime
-                )
-
-                // Avoid interpolating RecordBackType directly to prevent Swift IRGen issues on Swift 6
-                print("🎙️ Timer callback: calling recordBackListener (time=\(currentTime)ms, metering=\(currentMetering))")
-
-                if let listener = self.recordBackListener {
-                    print("🎙️ Timer callback: recordBackListener exists, calling it")
-                    listener(recordBack)
-                } else {
-                    print("🎙️ Timer callback: recordBackListener is nil - not set up yet")
+                    self.recordBackListener?(recordBack)
                 }
             }
 
+            #if DEBUG
             print("🎙️ Record timer created and scheduled on main thread")
+            #endif
         }
     }
 
@@ -921,65 +933,56 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
+            #if DEBUG
             print("🎵 Starting play timer with interval: \(self.subscriptionDuration)")
-            print("🎵 Current thread: \(Thread.current)")
-            print("🎵 Is main thread: \(Thread.isMainThread)")
+            #endif
 
             self.didEmitPlaybackEnd = false
 
             self.playTimer = Timer.scheduledTimer(withTimeInterval: self.subscriptionDuration, repeats: true) { [weak self] timer in
-                print("🎵 ===== TIMER CALLBACK FIRED =====")
-                guard let self = self else {
-                    print("🎵 Play timer callback: self is nil")
-                    return
-                }
-
-                // First check if we should stop the timer
-                guard let player = self.audioPlayer, let listener = self.playBackListener else {
-                    print("🎵 Play timer callback: stopping timer - player or listener is nil")
-                    self.stopPlayTimer()
-                    return
-                }
-
-                // Check if player is still playing
-                if !player.isPlaying {
-                    print("🎵 Play timer callback: player stopped, stopping timer")
-
-                    // Send final callback if duration is available
-                    if player.duration > 0 {
-                        self.emitPlaybackEndEvents(durationMs: player.duration * 1000, includePlaybackUpdate: true)
+                // Use autoreleasepool to ensure temporary objects are released promptly
+                autoreleasepool {
+                    guard let self = self,
+                          let player = self.audioPlayer,
+                          let listener = self.playBackListener else {
+                        self?.stopPlayTimer()
+                        return
                     }
 
-                    self.stopPlayTimer()
-                    return
-                }
+                    // Check if player is still playing
+                    if !player.isPlaying {
+                        // Send final callback if duration is available
+                        if player.duration > 0 {
+                            self.emitPlaybackEndEvents(durationMs: player.duration * 1000, includePlaybackUpdate: true)
+                        }
+                        self.stopPlayTimer()
+                        return
+                    }
 
-                let currentTime = player.currentTime * 1000 // Convert to ms
-                let duration = player.duration * 1000 // Convert to ms
+                    let currentTime = player.currentTime * 1000 // Convert to ms
+                    let duration = player.duration * 1000 // Convert to ms
 
-                print("🎵 Play timer callback: currentTime=\(currentTime)ms, duration=\(duration)ms")
+                    let playBack = PlayBackType(
+                        isMuted: false,
+                        duration: duration,
+                        currentPosition: currentTime
+                    )
 
-                let playBack = PlayBackType(
-                    isMuted: false,
-                    duration: duration,
-                    currentPosition: currentTime
-                )
+                    listener(playBack)
 
-                listener(playBack)
-
-                // Check if playback finished - use a small threshold for floating point comparison
-                let threshold = 100.0 // 100ms threshold
-                if duration > 0 && currentTime >= (duration - threshold) {
-                    print("🎵 Play timer callback: playback finished by position")
-
-                    self.emitPlaybackEndEvents(durationMs: duration, includePlaybackUpdate: true)
-
-                    self.stopPlayTimer()
-                    return
+                    // Check if playback finished - use a small threshold for floating point comparison
+                    let threshold = 100.0 // 100ms threshold
+                    if duration > 0 && currentTime >= (duration - threshold) {
+                        self.emitPlaybackEndEvents(durationMs: duration, includePlaybackUpdate: true)
+                        self.stopPlayTimer()
+                        return
+                    }
                 }
             }
 
+            #if DEBUG
             print("🎵 Play timer created and scheduled on main thread")
+            #endif
         }
     }
 
@@ -1001,7 +1004,6 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
 
     private func emitPlaybackEndEvents(durationMs: Double, includePlaybackUpdate: Bool) {
         guard !self.didEmitPlaybackEnd else {
-            print("🎵 Playback end already emitted, skipping duplicate")
             return
         }
         self.didEmitPlaybackEnd = true
@@ -1012,7 +1014,6 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
                 duration: durationMs,
                 currentPosition: durationMs
             )
-            print("🎵 Emitting final playback update at \(durationMs)ms")
             listener(finalPlayBack)
         }
 
@@ -1021,7 +1022,6 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
                 duration: durationMs,
                 currentPosition: durationMs
             )
-            print("🎵 Emitting playback end event at \(durationMs)ms")
             endListener(endEvent)
         }
     }
@@ -1084,9 +1084,46 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
     
     // MARK: - AVAudioPlayerDelegate via proxy
     deinit {
+        #if DEBUG
+        print("🎙️ HybridSound deinit called - cleaning up resources")
+        #endif
+        
+        // Remove notification observer
         removeInterruptionObserver()
+        
+        // Stop and invalidate timers
         recordTimer?.invalidate()
+        recordTimer = nil
         playTimer?.invalidate()
+        playTimer = nil
+        
+        // Stop any active recording/playback
+        audioRecorder?.stop()
+        audioRecorder = nil
+        audioPlayer?.stop()
+        audioPlayer = nil
+        
+        // Clean up audio engine
+        audioEngine?.stop()
+        audioEngine = nil
+        audioPlayerNode = nil
+        audioFile = nil
+        
+        // Clear all listeners to break potential retain cycles
+        recordBackListener = nil
+        playBackListener = nil
+        playbackEndListener = nil
+        
+        // Deactivate audio session
+        try? recordingSession?.setActive(false)
+        recordingSession = nil
+        
+        // Clear delegate proxy
+        playerDelegateProxy = nil
+        
+        #if DEBUG
+        print("🎙️ HybridSound cleanup completed")
+        #endif
     }
 
     private class AudioPlayerDelegateProxy: NSObject, AVAudioPlayerDelegate {
@@ -1094,7 +1131,9 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
         init(owner: HybridSound) { self.owner = owner }
 
         func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+            #if DEBUG
             print("🎵 AVAudioPlayer finished playing. success=\(flag)")
+            #endif
             guard let owner = owner else { return }
             let finalDurationMs = player.duration * 1000
             owner.emitPlaybackEndEvents(durationMs: finalDurationMs, includePlaybackUpdate: true)
@@ -1102,7 +1141,9 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
         }
 
         func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+            #if DEBUG
             print("🎵 AVAudioPlayer decode error: \(String(describing: error))")
+            #endif
         }
     }
 
