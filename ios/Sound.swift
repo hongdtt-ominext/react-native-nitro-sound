@@ -1036,10 +1036,78 @@ final class HybridSound: HybridSoundSpec_base, HybridSoundSpec_protocol {
             name: AVAudioSession.interruptionNotification,
             object: nil
         )
+        
+        // Observe app termination to finalize recording
+        NotificationCenter.default.removeObserver(self, name: UIApplication.willTerminateNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
+        
     }
     
     private func removeInterruptionObserver() {
         NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: UIApplication.willTerminateNotification, object: nil)
+    }
+    
+    /**
+     * Called when the app is about to be terminated (e.g., user swipe kills the app).
+     * This ensures the audio file is properly finalized so it can be opened later.
+     */
+    @objc private func handleAppWillTerminate(notification: Notification) {
+        finalizeRecordingOnKill()
+    }
+    
+    /**
+     * Safely finalize the recording when app is being killed or entering background.
+     * This ensures the audio file header is written correctly and the file can be played back.
+     */
+    private func finalizeRecordingOnKill() {
+        guard let recorder = audioRecorder else { return }
+        
+        let fileURL = recorder.url
+        let currentTime = recorder.currentTime * 1000
+        
+        print("🎙️ Finalizing recording on app kill/background...")
+        print("🎙️ Recording path: \(fileURL.path)")
+        
+        // Stop recording to finalize file headers
+        recorder.stop()
+        stopRecordTimer()
+        
+        // Check if file was saved properly
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: fileURL.path) {
+            do {
+                let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
+                let fileSize = attributes[.size] as? Int64 ?? 0
+                print("🎙️ Audio file saved successfully: \(fileURL.path) (\(fileSize) bytes)")
+            } catch {
+                print("🎙️ Could not get file attributes: \(error)")
+            }
+        } else {
+            print("🎙️ ⚠️ Audio file not found after finalization: \(fileURL.path)")
+        }
+        
+        // Notify listener with final state
+        if let listener = recordBackListener {
+            listener(RecordBackType(
+                isRecording: false,
+                currentPosition: currentTime,
+                currentMetering: nil,
+                recordSecs: currentTime
+            ))
+        }
+        
+        // Cleanup
+        audioRecorder = nil
+        try? recordingSession?.setActive(false)
+        recordingSession = nil
+        
+        print("🎙️ Recording finalized successfully")
     }
     
     @objc private func handleAudioSessionInterruption(notification: Notification) {

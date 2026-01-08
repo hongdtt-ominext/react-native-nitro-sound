@@ -110,6 +110,64 @@ class RecordingForegroundService : Service() {
         super.onDestroy()
     }
     
+    /**
+     * Called when user swipes away the app from recents.
+     * This ensures the audio file is properly finalized so it can be opened later.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Finalize the audio file before the app is killed
+        finalizeRecordingOnKill()
+        super.onTaskRemoved(rootIntent)
+        // Stop the service after finalizing
+        stopSelf()
+    }
+    
+    /**
+     * Safely finalize the recording when app is being killed.
+     * This ensures the audio file header is written correctly and the file can be played back.
+     */
+    private fun finalizeRecordingOnKill() {
+        try {
+            if (isRecording || isPaused) {
+                Logger.d("[ForegroundService] Finalizing recording on app kill...")
+                
+                stopRecordTimer()
+                
+                mediaRecorder?.apply {
+                    try {
+                        // Stop the recorder to write file headers
+                        stop()
+                        Logger.d("[ForegroundService] MediaRecorder stopped successfully")
+                    } catch (e: Exception) {
+                        Logger.e("[ForegroundService] Error stopping MediaRecorder: ${e.message}", e)
+                    }
+                    try {
+                        release()
+                        Logger.d("[ForegroundService] MediaRecorder released successfully")
+                    } catch (e: Exception) {
+                        Logger.e("[ForegroundService] Error releasing MediaRecorder: ${e.message}", e)
+                    }
+                }
+                mediaRecorder = null
+                
+                // Log the saved file path for debugging
+                currentRecordingPath?.let { path ->
+                    val file = File(path)
+                    if (file.exists()) {
+                        Logger.d("[ForegroundService] Audio file saved: $path (${file.length()} bytes)")
+                    } else {
+                        Logger.e("[ForegroundService] Audio file not found after finalization: $path")
+                    }
+                }
+                
+                isRecording = false
+                isPaused = false
+            }
+        } catch (e: Exception) {
+            Logger.e("[ForegroundService] Error finalizing recording on kill: ${e.message}", e)
+        }
+    }
+    
     // ==================== Recording Methods ====================
     
     fun startRecording(
